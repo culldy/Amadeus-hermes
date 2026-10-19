@@ -1,0 +1,4 @@
+{
+  "TTS_BACKEND": "gpt_sovits",
+  "TTS_VOICE_PROFILE": "kurisu_v3"
+}

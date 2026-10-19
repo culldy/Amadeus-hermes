@@ -4,6 +4,8 @@
 
 **此包需要已配置好的、支持第四栏接口的本地 Amadeus 后端，不是独立运行的聊天服务。普通上游 Amadeus / 当前仓库主分支的后端尚不保证兼容。** 后端接口和人格表现仍在开发；公开插件不代表所有功能均已实机验收。
 
+语音使用本地 **GPT-SoVITS V3**，不采用 Fish 或本地/Fish 混合路由。后端全局 `TTS_BACKEND` 应为 `gpt_sovits`，两位角色各自的 `runtime/characters/<角色>/voice.json` 也应选择此后端，避免角色配置覆盖全局设置。`examples/` 提供无密钥的绑定示例；修改已有绑定时保留自己的参考音配置并先备份。千枝实的 `chiemi_v1` 是既有音色配置名，实际推理使用 V3 的 `s2Gv3.pth`；红莉栖使用 `kurisu_v3`。权重和参考音须自行准备，不随插件发布。
+
 ## 安装
 
 1. 使用支持运行时 `plugin.js`、`SandboxedFrame`、会话归属和 `profileRoutes` SDK 的 Hermes Windows 桌面版。开发验证宿主为 v0.21.7；其他版本未验证。
