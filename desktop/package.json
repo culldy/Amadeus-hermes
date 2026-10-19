@@ -1,0 +1,17 @@
+{
+  "name": "amadeus-hermes-desktop-plugin",
+  "version": "0.1.0-preview.1",
+  "private": true,
+  "type": "module",
+  "license": "AGPL-3.0-only",
+  "scripts": {
+    "build": "node build.mjs",
+    "test": "node --experimental-vm-modules --test tests/*.test.mjs"
+  },
+  "dependencies": {
+    "qrcode": "1.5.4"
+  },
+  "devDependencies": {
+    "esbuild": "0.28.1"
+  }
+}
