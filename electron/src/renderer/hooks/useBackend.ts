@@ -46,7 +46,7 @@ type BackendConnection = {
 const RECONNECT_DELAY = 2000
 const MAX_RECONNECT_DELAY = 30000
 
-export function useBackend() {
+export function useBackend(getConnection?: (signal: AbortSignal) => Promise<BackendConnection>) {
   const wsRef = useRef<WebSocket | null>(null)
   const [connected, setConnected] = useState(false)
   const subscribersRef = useRef<Map<string, Set<Subscriber>>>(new Map())
@@ -58,11 +58,6 @@ export function useBackend() {
   const reconnectDelay = useRef(RECONNECT_DELAY)
   const reconnectTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
   const connectionRef = useRef<BackendConnection | null>(null)
-  const connectionWaitersRef = useRef<Set<{
-    resolve: () => void
-    reject: (error: Error) => void
-    timer: ReturnType<typeof setTimeout>
-  }>>(new Set())
 
   const connect = useCallback((connection: BackendConnection) => {
     connectionRef.current = connection
@@ -77,11 +72,6 @@ export function useBackend() {
     ws.onopen = () => {
       setConnected(true)
       reconnectDelay.current = RECONNECT_DELAY
-      for (const waiter of connectionWaitersRef.current) {
-        clearTimeout(waiter.timer)
-        waiter.resolve()
-      }
-      connectionWaitersRef.current.clear()
     }
 
     ws.onmessage = (event) => {
@@ -115,7 +105,6 @@ export function useBackend() {
     }
 
     ws.onclose = () => {
-      if (wsRef.current !== ws) return
       setConnected(false)
       // reject all pending
       for (const [, p] of pendingRef.current) {
@@ -139,42 +128,6 @@ export function useBackend() {
     ws.onerror = () => { /* onclose handles cleanup */ }
   }, [])
 
-  const reconnect = useCallback(async (): Promise<void> => {
-    if (reconnectTimer.current) {
-      clearTimeout(reconnectTimer.current)
-      reconnectTimer.current = null
-    }
-    const previous = wsRef.current
-    wsRef.current = null
-    connectionRef.current = null
-    setConnected(false)
-    previous?.close()
-    for (const [, pending] of pendingRef.current) {
-      clearTimeout(pending.timer)
-      pending.reject(new Error('reconnecting'))
-    }
-    pendingRef.current.clear()
-
-    const connection = window.amadeus
-      ? await window.amadeus.getBackendConnection()
-      : { url: 'ws://127.0.0.1:17777/ws', protocols: [] }
-    if (!connection) throw new Error('backend instance is not authenticated')
-
-    const ready = new Promise<void>((resolve, reject) => {
-      const waiter = {
-        resolve,
-        reject,
-        timer: setTimeout(() => {
-          connectionWaitersRef.current.delete(waiter)
-          reject(new Error('backend reconnect timed out'))
-        }, 30_000),
-      }
-      connectionWaitersRef.current.add(waiter)
-    })
-    connect({ url: connection.url, protocols: connection.protocols })
-    await ready
-  }, [connect])
-
   const send = useCallback((method: string, params: Record<string, unknown> = {}): Promise<Record<string, unknown>> => {
     return new Promise((resolve, reject) => {
       const ws = wsRef.current
@@ -183,12 +136,10 @@ export function useBackend() {
         return
       }
       const id = crypto.randomUUID()
-      // Steam discovery alone can take 60 s; startup continues with window
-      // preparation and text-source checks after the game is found.
       const timer = setTimeout(() => {
         pendingRef.current.delete(id)
         reject(new Error('timeout'))
-      }, method === 'vn.launch.start' ? 75_000 : 30_000)
+      }, 30000)
       pendingRef.current.set(id, { resolve, reject, timer })
       ws.send(JSON.stringify({ type: 'req', id, method, params }))
     })
@@ -204,21 +155,23 @@ export function useBackend() {
   // cleanup on unmount
   useEffect(() => {
     return () => {
+      connectionRef.current = null
       if (reconnectTimer.current) clearTimeout(reconnectTimer.current)
       wsRef.current?.close()
-      for (const waiter of connectionWaitersRef.current) {
-        clearTimeout(waiter.timer)
-        waiter.reject(new Error('disconnected'))
-      }
-      connectionWaitersRef.current.clear()
     }
   }, [])
 
   // auto-connect to Python backend (via Electron IPC or direct URL)
   useEffect(() => {
+    const abort = new AbortController()
     const init = async () => {
       const amadeus = window.amadeus
       try {
+        if (getConnection) {
+          const connection = await getConnection(abort.signal)
+          if (!abort.signal.aborted) connect(connection)
+          return
+        }
         if (amadeus) {
           const connection = await amadeus.getBackendConnection()
           if (!connection) throw new Error('backend instance is not authenticated')
@@ -229,11 +182,12 @@ export function useBackend() {
         // corresponding Python backend runs in explicit development mode.
         connect({ url: 'ws://127.0.0.1:17777/ws', protocols: [] })
       } catch (error) {
-        console.error('[backend-connection] unavailable', error)
+        if (!abort.signal.aborted) console.error('[backend-connection] unavailable', error)
       }
     }
     init()
-  }, [connect])
+    return () => abort.abort()
+  }, [connect, getConnection])
 
-  return { send, subscribe, connected, reconnect }
+  return { send, subscribe, connected }
 }

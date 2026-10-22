@@ -1,4 +1,4 @@
-﻿/**
+/**
  * renderer.js — PixiJS render engine core
  *
  * Exposes window.renderApp for Python-side runJavaScript() calls:
@@ -7,12 +7,12 @@
  *   renderApp.setMouth(value 0-1)
  *   renderApp.setSubtitle(text)
  *   renderApp.loadSpriteFrames(emotion, [url, ...])
- *   renderApp.configureCharacter(hostConfig)
+ *   renderApp.loadLive2DModel(url)
  *   renderApp.loadTransitionFrames(fromEmotion, toEmotion, [url, ...])
- *   renderApp.triggerCharacterIntent(label, ownershipOptions)
+ *   renderApp.setMode('sprite'|'live2d'|'both')
  *
  * Deprecated compatibility boundary:
- * - SpriteRenderer retains the established SpriteForge frame contract.
+ * - SpriteRenderer and Live2DRenderer are the legacy foreground character paths.
  * - New wallpaper/work behavior should prefer SpriteForgeRuntime or
  *   wallpaper_scene.js scenario activities instead of adding new VTS/single
  *   sprite state here.
@@ -24,28 +24,41 @@
   // ---------------------------------------------------------------------------
   // PixiJS Application
   // ---------------------------------------------------------------------------
-  const renderParams = new URLSearchParams(window.location.search || "");
-  const graphicsProfile = renderParams.get("graphicsProfile") || "standard";
-  const renderBudget = window.RenderBudget.resolveRenderBudget({
-    maxFps: renderParams.get("renderMaxFps"),
-    maxResolution: renderParams.get("renderMaxResolution"),
-    textureSampling: renderParams.get("renderTextureSampling"),
-    devicePixelRatio: window.devicePixelRatio,
-  });
+  // In the Hermes character sandbox, prefer a physical GPU and avoid rendering
+  // a tiny pane at a giant high-DPI backing resolution. The regular Amadeus
+  // render surface retains its original resolution and antialias policy.
+  const hermesGpuPrimary = window.__AMADEUS_HERMES_GPU_PRIMARY === true;
   const app = new PIXI.Application({
     resizeTo: document.getElementById("canvas-container"),
-    backgroundAlpha: 0,          // Transparent background
+    backgroundAlpha: 0,
     autoDensity: true,
-    resolution: renderBudget.resolution,
-    antialias: true,
+    resolution: hermesGpuPrimary ? Math.min(window.devicePixelRatio || 1, 1.5) : (window.devicePixelRatio || 1),
+    antialias: !hermesGpuPrimary,
+    powerPreference: "high-performance",
+    forceCanvas: false,
   });
-  const frameRateController = window.RenderBudget.createFrameRateController(
-    app.ticker,
-    renderBudget.maxFps,
-  );
-  frameRateController.apply();
-  window.RenderBudget.installWallpaperEngineListener(window, frameRateController);
   document.getElementById("canvas-container").appendChild(app.view);
+  if (hermesGpuPrimary) {
+    const gl = app.renderer && app.renderer.gl;
+    let rendererName = "";
+    try {
+      if (gl) {
+        const debug = gl.getExtension("WEBGL_debug_renderer_info");
+        rendererName = String(debug ? gl.getParameter(debug.UNMASKED_RENDERER_WEBGL) : gl.getParameter(gl.RENDERER));
+      }
+    } catch (error) { rendererName = "WebGL (GPU detail unavailable)"; }
+    const software = !gl || /swiftshader|llvmpipe|software rasterizer|microsoft basic render driver/i.test(rendererName);
+    window.__AMADEUS_HERMES_GPU_STATUS = {
+      kind: software ? "software" : "webgl",
+      renderer: rendererName || (gl ? "WebGL (GPU detail unavailable)" : "Canvas / no WebGL"),
+      gpuPreferred: true,
+    };
+    if (software) {
+      // Do not silently burn CPU animating 7k+ SpriteForge frames in software.
+      app.ticker.stop();
+      console.error("[SpriteForge] GPU-required character rendering paused:", rendererName);
+    }
+  }
 
   // ---------------------------------------------------------------------------
   // SpriteRenderer — deprecated foreground sprite path kept for existing assets.
@@ -63,34 +76,49 @@
       /** emotion → PIXI.Texture[] */
       this._frames = {};
       this._frameUrls = {};
-      this._textureSamplingEnabled = renderBudget.textureSampling;
-      this._frameSamplingPlans = new Map();
-      this._requiredFrameIndices = new Map();
-      this._requiredFrameUrls = new Map();
-      this._textureSampleFps = null;
-      this._sampleTimeMs = null;
+      this._texturePromisesByUrl = new Map();
+      this._compressedTextureRuntimePromise = null;
+      this._compressedTextureRuntimeReady = false;
+      this._framePromises = {};
+      this._frameSetStates = {};
+      this._frameLoadQueue = new Map();
+      this._frameLoadSerial = 0;
+      this._activeFrameSetLoads = 0;
+      this._maxConcurrentFrameSetLoads = 1;
+      this._frameLoadPumpTimer = null;
       this._lastSpeechStateChangedAt = 0;
-      this._speechQuietBeforeWarmMs = 900;
-      this._prefetchHints = new Map();
-      this._textureDemandRevision = 0;
-      this._cycleDemandKey = "";
-      this._textureUrls = new WeakMap();
-      this._displayMisses = 0;
-      // Default-off, multi-clip probe seam with one active decoder pair.
-      // FrameStore owns static URLs; the source owns decoded video and
-      // independently retained output.
-      this._experimentalFrameVideos = new Map();
-      this._frameResourcePolicy = { mode: "static", budgetMiB: 2048 };
-      this._frameVideoConfig = null;
-      this._frameVideoSource = null;
-      this._videoDisplay = null;
-      this._videoFrozenHold = false;
-      this._frameVideoStats = { videoDisplays: 0, failures: 0, lastFailure: null,
-        staticBodyHoldDemands: 0, staticBodyFallbackDemands: 0 };
-      this._frameVideoStaticDemands = new Set();
+      this._framesPerLoadSlice = 2;
+      this._speechQuietBeforeSpeculativeMs = 900;
+      this._speculativeLoadEpoch = 0;
+      this._pinnedFrameLabels = new Set([
+        "idle",
+        "speaking_short",
+        "speaking_med",
+        "speaking_long",
+        "speaking_trans",
+        "speaking_loop1",
+        "speaking_loop2",
+        "closed_eye_trans",
+        "speaking_closed_eye_1",
+        "speaking_closed_eye_2",
+        "smile_speaking",
+        "sad_speaking",
+        "shy_speaking1",
+        "shy_speaking2",
+        "surprise_speaking",
+        "angry_speaking",
+      ]);
+      this._warmFrameLabels = new Set([
+        "thinking_trans",
+        "thinking_speaking1",
+        "thinking_speaking2",
+        "thinking_to_serious",
+        "thinking_to_key_point",
+        "key_point_speaking",
+        "serious_to_thinking",
+      ]);
       /** emotion → PIXI.Texture[][] (transition from→to) */
       this._transitions = {};
-      this._transitionUrls = {};
 
       this._currentEmotion = "normal";
       this._speaking = false;
@@ -124,250 +152,71 @@
       this.sprite.addChild(this._mouthOverlay);
       this._mouthConfigs = {};     // label → js_cfg
 
-      this._characterActive = true;
-      this._openFrameResources();
-      window.addEventListener("unload", () => {
-        if (this._videoDisplay) this.sprite.texture = PIXI.Texture.EMPTY;
-        this._releaseVideoDisplay();
-        this._releaseFrameVideoSource();
-        this._frameStore.destroy();
-        this._frameBackend.dispose();
-      }, { once: true });
-
       this._startIdleTicker();
-    }
-
-    _openFrameResources() {
-      this._frameBackend = window.FrameTextureBackend.createFrameTextureBackend({ renderer: app.renderer });
-      this._frameStore = window.FrameStore.createFrameStore({
-        backend: this._frameBackend,
-        // With sampling off, a lower presentation rate still visits the same
-        // source frames. Halving residency makes those frames churn on loops.
-        budgetBytes: this._frameResourcePolicy.budgetMiB * 1024 * 1024,
-        maxInFlight: 3,
-        onViewChange: (view, index, texture) => this._onTextureViewChange(view, index, texture),
-      });
-    }
-
-    setActive(active) {
-      const enabled = active === true;
-      if (this._characterActive === enabled) return;
-      this._characterActive = enabled;
-      if (!enabled) {
-        this.sprite.texture = PIXI.Texture.EMPTY;
-        this._videoFrozenHold = false;
-        this._releaseVideoDisplay();
-        this._releaseFrameVideoSource();
-        this._mouthOverlay.texture = PIXI.Texture.EMPTY;
-        this._hideMouthLayer();
-        this._transitionQueue = [];
-        this._frameStore.destroy();
-        this._frameBackend.dispose();
-        return;
-      }
-      this._openFrameResources();
-      this._cycleDemandKey = "";
-      this._textureDemandRevision++;
-      for (const hint of this._prefetchHints.values()) hint.load = undefined;
-      for (const [label, urls] of Object.entries(this._frameUrls)) {
-        this._frames[label] = new Array(urls.length);
-        this._frameStore.replaceViews("frames:" + label, urls);
-        this._updateRequiredPins(label);
-      }
-      for (const [label, urls] of Object.entries(this._transitionUrls)) {
-        this._transitions[label] = new Array(urls.length);
-        this._frameStore.replaceViews("transition:" + label, urls);
-        this._frameStore.replacePins("transition:" + label, urls);
-      }
-      this._mouthConfigSignatures = {};
-      for (const [label, config] of Object.entries(this._mouthConfigs)) this.loadMouthConfig(label, config);
-      this._refreshTextureDemand();
     }
 
     // ---- Asset loading ----
 
-    // Validated video descriptor: { headFrameCount, createSource({ onFrame, onError }) }.
-    // Source hasAny/has are readiness queries; texture uploads synchronously.
-    // requestWindow receives sampled source indices. releaseClip/destroy stop
-    // sessions, while retainDisplay/releaseDisplay own surviving output pixels.
-    setExperimentalFrameVideoSource(label, descriptor) {
-      if (descriptor && (typeof label !== "string" || !label)) {
-        throw new Error("Experimental frame video requires a named clip");
-      }
-      if (descriptor && (!Number.isInteger(descriptor.headFrameCount) || descriptor.headFrameCount < 1
-          || typeof descriptor.createSource !== "function")) {
-        throw new Error("Experimental frame video requires a static head and createSource");
-      }
-      const selected = label === this._currentEmotion;
-      if (this._frameVideoConfig?.label === label) this._releaseFrameVideoSource();
-      const frozenHold = selected && this._videoFrozenHold;
-      if (selected) this._videoFrozenHold = false;
-      if (descriptor) this._experimentalFrameVideos.set(label, { label, descriptor, failed: false });
-      else this._experimentalFrameVideos.delete(label);
-      if (frozenHold) {
-        const url = this._frameUrls[this._currentEmotion]?.[this._heldFrameIdx];
-        this._frameStore.replacePins("hold", url ? [url] : []);
-      }
-      this._frameVideoStaticDemands.clear();
-      this._textureDemandRevision++;
-      this._updateRequiredPins(label);
-      this._refreshTextureDemand();
-    }
-
-    getExperimentalFrameVideoStats(label = this._currentEmotion) {
-      // Static counters count unique body demand identities by reason for each
-      // installation, not backend fetches (which the probe records separately).
-      return { ...this._frameVideoStats, installed: this._experimentalFrameVideos.size > 0,
-        installedClips: this._experimentalFrameVideos.size, activeLabel: this._frameVideoConfig?.label || null,
-        active: !!this._frameVideoSource, failed: !!this._experimentalFrameVideos.get(label)?.failed };
-    }
-
-    _isVideoBodyIndex(label, index) {
-      const config = this._experimentalFrameVideos.get(label);
-      return !!config && index >= config.descriptor.headFrameCount
-        && index < (this._frameUrls[label] || []).length - 1;
-    }
-
-    _releaseFrameVideoSource() {
-      const source = this._frameVideoSource;
-      this._frameVideoSource = null; // Invalidate callbacks before closing resources.
-      this._frameVideoConfig = null;
-      if (!source) return;
-      source.releaseClip();
-      source.destroy(); // A retained display must survive until releaseDisplay.
-    }
-
-    _releaseVideoDisplay() {
-      const display = this._videoDisplay;
-      this._videoDisplay = null;
-      if (display) display.source.releaseDisplay(display.texture);
-    }
-
-    _failFrameVideoSource(error, config = this._frameVideoConfig) {
-      if (!config || config.failed) return;
-      config.failed = true;
-      this._frameVideoStats.failures++;
-      this._frameVideoStats.lastFailure = String(error?.message || error);
-      if (this._videoFrozenHold && config.label === this._currentEmotion) {
-        this._videoFrozenHold = false;
-        const url = this._frameUrls[config.label]?.[this._heldFrameIdx];
-        this._frameStore.replacePins("hold", url ? [url] : []);
-      }
-      if (this._frameVideoConfig === config) this._releaseFrameVideoSource();
-      this._textureDemandRevision++;
-      console.warn("[SpriteRenderer] frame video fallback:", error);
-      this._refreshTextureDemand();
-      this._frameVideoFailureHandler?.(error);
-    }
-
-    _syncFrameVideoSource(label) {
-      const config = this._experimentalFrameVideos.get(label);
-      if (this._frameVideoConfig !== config) this._releaseFrameVideoSource();
-      const eligible = this._characterActive && config && !config.failed
-        && !this._held && (this._frameUrls[label] || []).length > config.descriptor.headFrameCount + 1;
-      if (!eligible) {
-        this._releaseFrameVideoSource();
-        return null;
-      }
-      if (!this._frameVideoSource) {
-        let source, creationError;
-        try {
-          source = config.descriptor.createSource({
-            onFrame: index => {
-              if (this._frameVideoSource !== source || this._held || label !== this._currentEmotion) return;
-              const target = this._sampleFrameIndex(label, this._frameIdx, this._sampleTimeMs);
-              if (index === target) this._showFrame(this._frameIdx);
-            },
-            onError: error => {
-              if (!source) creationError = error;
-              else if (this._experimentalFrameVideos.get(label) === config
-                  && (this._frameVideoSource === source || this._videoDisplay?.source === source)) {
-                this._failFrameVideoSource(error, config);
-              }
-            },
-          });
-          if (creationError) {
-            source?.releaseClip();
-            source?.destroy();
-            throw creationError;
-          }
-          if (!source) throw new Error("Experimental frame video source was not created");
-          this._frameVideoSource = source;
-          this._frameVideoConfig = config;
-        } catch (error) { this._failFrameVideoSource(error, config); }
-      }
-      return this._frameVideoSource;
-    }
-
-    _hasReadyFrameVideo() {
-      try { return !!this._frameVideoSource?.hasAny(); }
-      catch (error) { this._failFrameVideoSource(error); return false; }
-    }
-
-    _staticFrameDemand(label, index, exactHold = false) {
-      if (!this._isVideoBodyIndex(label, index)) return true;
-      const config = this._experimentalFrameVideos.get(label);
-      // A frozen display belongs to the current healthy clip. It must not
-      // suppress static recovery for a different, already failed video label.
-      const reason = config.failed ? "Fallback"
-        : exactHold && this._held && !this._videoFrozenHold && label === this._currentEmotion ? "Hold" : null;
-      if (reason) {
-        const key = label + ":" + reason + ":" + index;
-        if (!this._frameVideoStaticDemands.has(key)) {
-          this._frameVideoStaticDemands.add(key);
-          this._frameVideoStats["staticBody" + reason + "Demands"]++;
-        }
-      }
-      return !!reason;
-    }
-
     loadFrames(emotion, urls) {
-      if (this._sameUrlList(this._frameUrls[emotion], urls) && this._frames[emotion]) return;
-      const list = Array.isArray(urls) ? urls.slice() : [];
-      const video = this._frameUrls[emotion] && this._experimentalFrameVideos.get(emotion);
-      this._frameUrls[emotion] = list;
-      this._frames[emotion] = new Array(list.length);
-      this._frameSamplingPlans.delete(emotion);
-      this._requiredFrameIndices.delete(emotion);
-      this._textureDemandRevision++;
-      // A descriptor qualifies this ordered static clip. Releasing its decoder
-      // alone would allow it to restart against different assets on the next tick.
-      if (video) this._failFrameVideoSource(new Error("Static frame assets changed; video requires revalidation"), video);
-      this._frameStore.replaceViews("frames:" + emotion, list);
-      this._updateRequiredPins(emotion);
-      this._refreshTextureDemand();
+      const owner = this._mouthAssetOwner(urls);
+      if (owner && owner !== this._characterOwner) {
+        this._characterOwner = owner;
+        this.clearMouthConfigs();
+      }
+      if (this._sameUrlList(this._frameUrls[emotion], urls) && this._frames[emotion]) {
+        return;
+      }
+      this._frameUrls[emotion] = Array.isArray(urls) ? urls.slice() : [];
+      console.log("[SpriteRenderer] registerFrames:", emotion, urls.length, "urls, first:", (urls[0]||'').slice(0, 100));
+      const textures = new Array(urls.length);
+      this._frames[emotion] = textures;
+      this._framePromises[emotion] = new Array(urls.length);
+      this._frameSetStates[emotion] = "cold";
+
+      // Poster frame keeps low-frequency graph hops from flashing blank while
+      // the full clip is still cold. The rest of the clip is loaded by the
+      // priority scheduler below.
+      this._ensureFrameIndex(emotion, 0);
+
+      const priority = this._initialFrameSetPriority(emotion);
+      if (priority > 0) {
+        this._queueFrameSet(emotion, priority, { reason: "register" });
+      }
     }
 
     loadTransitionFrames(fromEmotion, toEmotion, urls) {
       const key = `${fromEmotion}->${toEmotion}`;
-      const list = Array.isArray(urls) ? urls.slice() : [];
-      this._transitions[key] = new Array(list.length);
-      this._transitionUrls[key] = list;
-      this._frameStore.replaceViews("transition:" + key, list);
-      // The legacy API retains a complete transition until it is replaced.
-      this._frameStore.replacePins("transition:" + key, list);
+      const textures = new Array(urls.length);
+      this._transitions[key] = textures;
+      let loaded = 0;
+      urls.forEach((u, idx) => {
+        this._loadTextureFromImage(u).then((tex) => {
+          if (!tex) return;
+          textures[idx] = tex;
+          loaded++;
+          if (loaded === urls.length) {
+            console.log("[SpriteRenderer] transition ready:", key, loaded);
+          }
+        });
+      });
     }
 
     // ---- State control ----
 
-    setEmotion(emotion) {
-      if (emotion === this._currentEmotion) return;
+    setEmotion(emotion, force = false) {
+      if (!force && emotion === this._currentEmotion) return;
       const key = `${this._currentEmotion}->${emotion}`;
       const transFrames = this._transitions[key];
       const prev = this._currentEmotion;
-      console.log("[SpriteRenderer] setEmotion: %s → %s (transition=%s, hasFrames=%s)",
-        prev, emotion, key in this._transitions, !!this._frames[emotion]);
+      console.log("[SpriteRenderer] setEmotion: %s → %s (transition=%s, hasFrames=%s, force=%s)",
+        prev, emotion, key in this._transitions, !!this._frames[emotion], force);
       this._currentEmotion = emotion;
-      this._updateRequiredPins(prev);
-      this._updateRequiredPins(emotion);
-      this._videoFrozenHold = false;
       this._frameIdx = 0;
-      this._sampleTimeMs = null;
       this._cycleCompletedForEmotion = "";
       this._hideMouthLayer();
-      this._refreshTextureDemand();
+      this._queueFrameSet(emotion, this._priorityScore("current"), { reason: "current" });
 
-      if (transFrames && transFrames.length > 0) {
+      if (!force && transFrames && transFrames.length > 0) {
         this._playTransition(transFrames, () => this._showFrame(0));
       } else {
         this._showFrame(0);
@@ -377,22 +226,24 @@
     setSpeaking(speaking) {
       if (this._speaking === speaking) return;
       this._speaking = speaking;
-      this._textureDemandRevision++;
+      if (!speaking) this._mouthValue = 0;
       this._lastSpeechStateChangedAt = Date.now();
       if (speaking) {
+        this.clearSpeculativeFrameLoads();
+      } else {
+        this._scheduleFrameLoadPump(320);
+      }
+      if (speaking) {
         this._frameIdx = 0;
-        this._sampleTimeMs = null;
         this._cycleCompletedForEmotion = "";
         this._held = false;
-        this._videoFrozenHold = false;
-        this._frameStore.replacePins("hold", []);
       }
-      this._refreshTextureDemand();
       this._updateMouthLayer();
     }
 
     setMouth(value) {
-      this._mouthValue = Math.max(0, Math.min(1, value));
+      this._mouthValue = Number.isFinite(value) ? Math.max(0, Math.min(1, value)) : 0;
+      if (this._speaking) this._showFrame(this._frameIdx);
       this._updateMouthLayer();
     }
 
@@ -401,44 +252,63 @@
     }
 
     setIdleFrameIntervalMs(emotion, intervalMs) {
-      const previous = this._frameIntervals[emotion];
       this._frameIntervals[emotion] = intervalMs;
-      this._frameSamplingPlans.delete(emotion);
-      this._textureDemandRevision++;
-      if (previous !== undefined && previous !== intervalMs) {
-        this._failFrameVideoSource(new Error("Static frame timing changed; video requires revalidation"),
-          this._experimentalFrameVideos.get(emotion) || null);
-      }
-      this._refreshTextureDemand();
     }
 
     setClipConfig(emotion, config) {
       this._clipConfigs[emotion] = config;
-      this._textureDemandRevision++;
-      this._refreshTextureDemand();
     }
 
     setCycleCompleteHandler(handler) {
       this._cycleCompleteHandler = handler;
     }
 
+    clearMouthConfigs() {
+      this._mouthConfigs = {};
+      this._mouthTextures = {};
+      this._mouthConfigSignatures = {};
+      this._hideMouthLayer();
+    }
+
     loadMouthConfig(label, config) {
+      if (label === "__clear_all__" || !config || Object.keys(config).length === 0) {
+        if (label === "__clear_all__") {
+          this.clearMouthConfigs();
+          return;
+        }
+        delete this._mouthConfigs[label];
+        delete this._mouthTextures[label];
+        delete this._mouthConfigSignatures[label];
+        if (label === this._currentEmotion) {
+          this._hideMouthLayer();
+        }
+        return;
+      }
+      const owner = this._mouthAssetOwner(config.frameUrls);
+      if (!owner || owner !== this._characterOwner) return;
       const signature = JSON.stringify(config || {});
       if (this._mouthConfigSignatures[label] === signature && this._mouthTextures[label]) {
         return;
       }
       this._mouthConfigSignatures[label] = signature;
       this._mouthConfigs[label] = config;
-      this._frameSamplingPlans.delete(label);
-      this._textureDemandRevision++;
       const urls = Array.isArray(config.frameUrls) ? config.frameUrls : [];
       const textures = new Array(urls.length);
       this._mouthTextures[label] = textures;
-      if (label === this._currentEmotion) this._hideMouthLayer();
-      this._frameStore.replaceViews("mouth:" + label, urls);
-      this._frameStore.replacePins("mouth:" + label, urls);
-      this._updateRequiredPins(label);
-      this._refreshTextureDemand();
+      urls.forEach((u, idx) => {
+        this._loadTextureFromImage(u).then((tex) => {
+          if (!tex || this._mouthConfigs[label] !== config || this._characterOwner !== owner) return;
+          textures[idx] = tex;
+          if (label === this._currentEmotion) {
+            this._updateMouthLayer();
+          }
+        });
+      });
+      const levels = config.opennessByFrame || [];
+      const openFrame = levels.indexOf(Math.max(...levels));
+      if (openFrame >= 0) this._ensureFrameIndex(label, openFrame).then(() => {
+        if (this._mouthConfigs[label] === config && label === this._currentEmotion) this._showFrame(this._frameIdx);
+      });
       console.log("[SpriteRenderer] mouth config for", label, JSON.stringify(config).slice(0, 120));
     }
 
@@ -450,212 +320,217 @@
       return true;
     }
 
-    _sampleFrameIndex(emotion, idx, timeMs = null) {
-      if (!this._textureSamplingEnabled) return idx;
-      const count = (this._frameUrls[emotion] || []).length;
-      const interval = this._frameIntervals[emotion];
-      if (!count || !(interval > 0)) return idx;
-      const fps = frameRateController.effectiveMaxFps;
-      if (this._textureSampleFps !== fps) {
-        // The host cap changes sampling density, never the authored clock or
-        // the user's sampling choice. Required/held sources survive replanning.
-        this._textureSampleFps = fps;
-        this._frameSamplingPlans.clear();
-        this._textureDemandRevision++;
+    _mouthAssetOwner(urls) {
+      const match = String((urls || [])[0] || '').replace(/\\/g, '/').match(/\/spriteforge\/runtime\/([^/]+)\//);
+      return match ? match[1] : '';
+    }
+
+    _mouthIsOpen() {
+      // Values are normalized physical-audio RMS; quiet speech must still open.
+      return this._speaking && this._mouthValue > 0.02;
+    }
+
+    _speakingFrame(idx, frames) {
+      const cfg = this._mouthConfigs[this._currentEmotion];
+      if (!cfg || cfg.mode !== 'silence_close' || !this._mouthIsOpen()) return idx;
+      const levels = cfg.opennessByFrame || [];
+      const target = Math.max(0.35, this._mouthValue);
+      if (Number(levels[idx]) >= target) return idx;
+      let selected = idx, nearest = Infinity;
+      for (let i = 0; i < Math.min(levels.length, frames.length); i++) {
+        if (!frames[i] || Number(levels[i]) < target) continue;
+        const distance = Math.min(Math.abs(i - idx), frames.length - Math.abs(i - idx));
+        if (distance < nearest) { nearest = distance; selected = i; }
       }
-      let plan = this._frameSamplingPlans.get(emotion);
-      if (!plan) {
-        const cfg = this._mouthConfigs[emotion] || {};
-        const required = Array.from(this._requiredFrameIndices.get(emotion) || []);
-        // Replanning after an asset/timing change must preserve an exact hold.
-        if (this._held && emotion === this._currentEmotion) required.push(this._heldFrameIdx);
-        if (Number.isInteger(cfg.closedFrameIdx)) required.push(cfg.closedFrameIdx);
-        const openness = cfg.opennessByFrame || [];
-        let minimum = Infinity, closed = -1;
-        for (let i = 0; i < Math.min(count, openness.length); i++) {
-          const value = Number(openness[i]);
-          if (Number.isFinite(value) && value < minimum) { minimum = value; closed = i; }
-        }
-        if (closed >= 0) required.push(closed);
-        plan = window.RenderBudget.createFrameSamplingPlan(count, interval, this._textureSampleFps, required);
-        this._frameSamplingPlans.set(emotion, plan);
-      }
-      if (timeMs !== null && !this._held && idx !== count - 1) {
-        // Nearest presentation avoids jitter-induced repeated poses in the
-        // video policy. Static mode keeps its established floor semantics;
-        // full-density clips always keep the authored source clock.
-        const sample = timeMs / plan.sampleIntervalMs;
-        const nearest = this._frameResourcePolicy.mode === "video" && plan.timelineIndices.length < count;
-        const slot = Math.min(plan.timelineIndices.length - 1,
-          nearest ? Math.round(sample) : Math.floor(sample));
-        const selected = plan.timelineIndices[slot] ?? idx;
-        // The legacy speaking loop deliberately excludes its zero/neutral pose.
-        if (selected === 0 && idx > 0 && this._speaking && !this._mouthConfigs[emotion]
-            && this._clipConfigs[emotion]?.loopMode !== "once_then_hold") {
-          return plan.indices.find(index => index > 0) ?? idx;
-        }
-        return selected;
-      }
-      return plan.sourceIndex[idx] ?? idx;
+      return selected;
     }
 
     prefetchLabels(labels, priority = "interactive", options = {}) {
       const score = this._priorityScore(priority);
       if (!score) return;
-      const owner = "prefetch:" + (options.reason || priority);
-      this._prefetchHints.set(owner, {
-        labels: Array.from(new Set((labels || []).filter(Boolean))),
-        priority: score,
-        headMs: Number.isFinite(options.headMs) && options.headMs >= 0 ? options.headMs : null,
-      });
-      this._refreshTextureDemand();
+      for (const label of labels || []) {
+        const emotion = String(label || "").trim();
+        if (!emotion) continue;
+        this._queueFrameSet(emotion, score, {
+          reason: options.reason || priority,
+          speculative: !!options.speculative,
+        });
+      }
+    }
+
+    clearSpeculativeFrameLoads() {
+      let cleared = 0;
+      this._speculativeLoadEpoch += 1;
+      for (const [label, entry] of Array.from(this._frameLoadQueue.entries())) {
+        if (entry && entry.speculative) {
+          this._frameLoadQueue.delete(label);
+          cleared += 1;
+        }
+      }
+      if (cleared > 0) {
+        console.log("[SpriteRenderer] cleared speculative frame loads:", cleared);
+      }
+    }
+
+    _initialFrameSetPriority(emotion) {
+      if (this._pinnedFrameLabels.has(emotion)) return 100;
+      if (this._warmFrameLabels.has(emotion)) return 65;
+      return 0;
     }
 
     _priorityScore(priority) {
       if (typeof priority === "number") return priority;
-      return ({ pinned: 100, current: 100, interactive: 90, speaking: 85, warm: 65, ambient: 25, poster: 10 })[priority] || 0;
+      if (priority === "pinned" || priority === "current") return 100;
+      if (priority === "interactive") return 90;
+      if (priority === "speaking") return 85;
+      if (priority === "warm") return 65;
+      if (priority === "ambient") return 25;
+      if (priority === "poster") return 10;
+      return 0;
     }
 
-    _updateRequiredPins(label) {
-      const urls = this._frameUrls[label] || [];
-      const cfg = this._mouthConfigs[label] || {};
-      const indices = new Set([0]);
-      if (label === this._currentEmotion && this._experimentalFrameVideos.has(label) && urls.length) indices.add(urls.length - 1);
-      if (Number.isInteger(cfg.closedFrameIdx)) indices.add(cfg.closedFrameIdx);
-      let minimum = Infinity, closed = -1;
-      for (let i = 0; i < Math.min(urls.length, (cfg.opennessByFrame || []).length); i++) {
-        const value = Number(cfg.opennessByFrame[i]);
-        if (Number.isFinite(value) && value < minimum) { minimum = value; closed = i; }
-      }
-      if (closed >= 0) indices.add(closed);
-      const required = [...indices].map(index => urls[index]).filter(Boolean);
-      this._requiredFrameUrls.set(label, required);
-      this._frameStore.replacePins("required:" + label, required);
+    _queueFrameSet(emotion, priority, options = {}) {
+      if (!emotion || !this._frameUrls[emotion] || !this._frameUrls[emotion].length) return;
+      const currentState = this._frameSetStates[emotion];
+      if (currentState === "warm" && priority < 100) return;
+      const existing = this._frameLoadQueue.get(emotion);
+      const next = {
+        priority: Math.max(priority, existing ? existing.priority : 0),
+        serial: existing ? existing.serial : ++this._frameLoadSerial,
+        speculative: !!(options.speculative || (existing && existing.speculative)),
+        speculativeEpoch: options.speculative ? this._speculativeLoadEpoch : (existing && existing.speculativeEpoch) || this._speculativeLoadEpoch,
+        reason: options.reason || (existing && existing.reason) || "",
+      };
+      this._frameLoadQueue.set(emotion, next);
+      this._scheduleFrameLoadPump(0);
     }
 
-    _onTextureViewChange(view, index, texture) {
-      const colon = view.indexOf(":");
-      const kind = view.slice(0, colon), label = view.slice(colon + 1);
-      const arrays = kind === "mouth" ? this._mouthTextures : kind === "transition" ? this._transitions : this._frames;
-      const frames = arrays[label];
-      if (!frames || index >= frames.length) return;
-      frames[index] = texture;
-      if (!texture) return;
-      if (kind === "frames") {
-        this._textureUrls.set(texture, this._frameUrls[label][index]);
-        if (label === this._currentEmotion) {
-          const target = this._held ? this._heldFrameIdx : this._frameIdx;
-          if (index === this._sampleFrameIndex(label, target, this._held ? null : this._sampleTimeMs)) this._showFrame(target);
-        }
-      } else if (kind === "mouth") {
-        const url = this._mouthConfigs[label]?.frameUrls?.[index];
-        if (url) this._textureUrls.set(texture, url);
-        if (label === this._currentEmotion) this._updateMouthLayer();
-      } else if (kind === "transition") {
-        this._textureUrls.set(texture, this._transitionUrls[label][index]);
-      }
+    _scheduleFrameLoadPump(delayMs = 0) {
+      if (this._frameLoadPumpTimer) return;
+      this._frameLoadPumpTimer = setTimeout(() => {
+        this._frameLoadPumpTimer = null;
+        this._pumpFrameLoadQueue();
+      }, Math.max(0, delayMs));
     }
 
-    _refreshTextureDemand(sourceIndex = this._frameIdx) {
-      const label = this._frames[this._currentEmotion] ? this._currentEmotion : "normal";
-      const urls = this._frameUrls[label] || [];
-      const interval = this._frameIntervals[label] || this._clipConfigs[label]?.frameIntervalMs || 150;
-      const once = this._clipConfigs[label]?.loopMode === "once_then_hold";
-      const video = this._syncFrameVideoSource(label);
-      const videoRequests = [];
-      const requests = [], now = this._frameBackend.now();
-      let index = this._held ? this._heldFrameIdx : sourceIndex;
-      const count = this._held ? 1 : Math.min(urls.length, Math.ceil(500 / interval) + 1);
-      for (let step = 0; step < count && urls.length; step++) {
-        const selected = this._sampleFrameIndex(label, index, this._held ? null : index * interval);
-        if (urls[selected]) {
-          const demand = { priority: 100, deadline: now + step * interval };
-          if (this._staticFrameDemand(label, selected, this._held)) requests.push({ url: urls[selected], ...demand });
-          else if (video) videoRequests.push({ index: selected, ...demand });
-        }
-        if (once && index >= urls.length - 1) break;
-        index = this._speaking && !this._mouthConfigs[label] && !once && urls.length > 1
-          ? (index % (urls.length - 1)) + 1 : (index + 1) % urls.length;
-      }
-      // Active closure poses and mouth overlays must share playback urgency,
-      // even while posters for other labels are loading in the background.
-      for (const url of [...(this._held ? [] : this._requiredFrameUrls.get(label) || []),
-        ...(this._mouthConfigs[label]?.frameUrls || [])]) requests.push({ url, priority: 100, deadline: now });
-      this._frameStore.replaceDemand("current", requests);
-      if (video) {
-        try { video.requestWindow(videoRequests); }
-        catch (error) { this._failFrameVideoSource(error); }
-      }
-      const cycleKey = `${label}:${this._textureDemandRevision}:${this._speaking}:${this._held}:${once}`;
-      if (cycleKey !== this._cycleDemandKey) {
-        this._cycleDemandKey = cycleKey;
-        const cycle = [];
-        if (!once && !this._held) for (let i = 0; i < urls.length; i++) {
-          const selected = this._sampleFrameIndex(label, i, i * interval);
-          if (urls[selected] && this._staticFrameDemand(label, selected)) cycle.push({ url: urls[selected], priority: 80 });
-        }
-        // Keep visited frames ahead of speculative long heads. The current
-        // window, short interrupt prefixes and known next heads still win.
-        // Only the near window starts loads; the cycle is neither a pin nor an
-        // instruction to decode the whole clip up front. Stronger needs win.
-        this._frameStore.replaceDemand("current-cycle", cycle, { load: false });
-      }
-      const deferred = this._speaking || Date.now() - this._lastSpeechStateChangedAt < this._speechQuietBeforeWarmMs;
-      for (const [owner, hint] of this._prefetchHints) {
-        const load = !deferred || hint.priority >= 90;
-        if (hint.revision !== this._textureDemandRevision) {
-          hint.requests = [];
-          for (const target of hint.labels) {
-            const frames = this._frameUrls[target] || [];
-            const timing = this._frameIntervals[target] || this._clipConfigs[target]?.frameIntervalMs || 150;
-            const headMs = hint.headMs ?? (this._clipConfigs[target]?.loopMode === "once_then_hold" ? 750 : 250);
-            // Entry hints keep their own horizon. The selected current window
-            // fills the remaining static head while its one decoder starts.
-            for (let i = 0; i < Math.min(frames.length, Math.ceil(headMs / timing) + 1); i++) {
-              const selected = this._sampleFrameIndex(target, i, i * timing);
-              if (frames[selected] && this._staticFrameDemand(target, selected)) {
-                hint.requests.push({ url: frames[selected], priority: hint.priority, deadline: Infinity });
-              }
-            }
+    _pumpFrameLoadQueue() {
+      while (this._activeFrameSetLoads < this._maxConcurrentFrameSetLoads && this._frameLoadQueue.size > 0) {
+        let selectedLabel = "";
+        let selectedEntry = null;
+        for (const [label, entry] of this._frameLoadQueue.entries()) {
+          if (this._shouldDeferFrameSet(entry)) continue;
+          const isCurrent = label === this._currentEmotion;
+          const selectedIsCurrent = selectedLabel === this._currentEmotion;
+          if (
+            !selectedEntry ||
+            (isCurrent && !selectedIsCurrent) ||
+            (isCurrent === selectedIsCurrent && (
+              entry.priority > selectedEntry.priority ||
+              (entry.priority === selectedEntry.priority && entry.serial < selectedEntry.serial)
+            ))
+          ) {
+            selectedLabel = label;
+            selectedEntry = entry;
           }
-          hint.revision = this._textureDemandRevision;
-          hint.load = undefined;
         }
-        if (hint.load !== load) {
-          hint.load = load;
-          this._frameStore.replaceDemand(owner, hint.requests, { load });
+        if (!selectedLabel) {
+          this._scheduleFrameLoadPump(360);
+          return;
+        }
+        this._frameLoadQueue.delete(selectedLabel);
+        this._activeFrameSetLoads += 1;
+        this._loadFrameSet(selectedLabel, selectedEntry).finally(() => {
+          this._activeFrameSetLoads = Math.max(0, this._activeFrameSetLoads - 1);
+          this._scheduleFrameLoadPump(0);
+        });
+      }
+    }
+
+    _shouldDeferFrameSet(entry) {
+      if (!entry) return false;
+      if (entry.priority >= 90) return false;
+      if (this._speaking) return true;
+      const quietMs = Date.now() - this._lastSpeechStateChangedAt;
+      return quietMs < this._speechQuietBeforeSpeculativeMs;
+    }
+
+    async _loadFrameSet(emotion, entry) {
+      const urls = this._frameUrls[emotion] || [];
+      if (!urls.length) return;
+      this._frameSetStates[emotion] = "loading";
+      console.log("[SpriteRenderer] frame load start:", emotion, urls.length, entry && entry.reason ? entry.reason : "");
+      let loadedThisSlice = 0;
+      for (let i = 0; i < urls.length; i += 1) {
+        if (entry && entry.speculative && entry.speculativeEpoch !== this._speculativeLoadEpoch) {
+          this._frameSetStates[emotion] = "cold";
+          return;
+        }
+        // A pose change must not wait for an unrelated 180–360-frame clip.
+        // Otherwise the previous closed-mouth texture stays visible in speech.
+        if (emotion !== this._currentEmotion && this._frameLoadQueue.has(this._currentEmotion)) {
+          this._frameSetStates[emotion] = "cold";
+          this._queueFrameSet(emotion, entry.priority, entry);
+          return;
+        }
+        if (this._shouldDeferFrameSet(entry)) {
+          this._frameSetStates[emotion] = "cold";
+          this._queueFrameSet(emotion, entry.priority, entry);
+          return;
+        }
+        await this._ensureFrameIndex(emotion, i);
+        loadedThisSlice += 1;
+        if (loadedThisSlice >= this._framesPerLoadSlice) {
+          loadedThisSlice = 0;
+          await this._yieldFrameLoadSlice(entry);
         }
       }
+      this._frameSetStates[emotion] = "warm";
+      console.log("[SpriteRenderer] frame load ready:", emotion, urls.length);
+    }
+
+    _yieldFrameLoadSlice(entry) {
+      const delay = this._speaking ? 16 : (entry && entry.priority >= 90 ? 0 : 24);
+      if (typeof requestIdleCallback === "function" && (!entry || entry.priority < 90) && !this._speaking) {
+        return new Promise((resolve) => requestIdleCallback(resolve, { timeout: 80 }));
+      }
+      return new Promise((resolve) => setTimeout(resolve, delay));
+    }
+
+    _ensureFrameIndex(emotion, idx) {
+      const urls = this._frameUrls[emotion] || [];
+      const textures = this._frames[emotion] || [];
+      if (!urls.length || idx < 0 || idx >= urls.length) return Promise.resolve(null);
+      if (textures[idx]) return Promise.resolve(textures[idx]);
+      if (!this._framePromises[emotion]) this._framePromises[emotion] = new Array(urls.length);
+      if (this._framePromises[emotion][idx]) return this._framePromises[emotion][idx];
+
+      const promise = this._loadTextureFromImage(urls[idx]).then((tex) => {
+        if (tex) {
+          textures[idx] = tex;
+          if (emotion === this._currentEmotion && idx === this._frameIdx) {
+            this._showFrame(idx);
+          }
+        }
+        return tex;
+      }).finally(() => {
+        if (this._framePromises[emotion]) this._framePromises[emotion][idx] = null;
+      });
+      this._framePromises[emotion][idx] = promise;
+      return promise;
     }
 
     holdFrame(which) {
       if (which === undefined || which === null) {
-        this._heldFrameIdx = this._textureSamplingEnabled ? this._activeFrameIdx : this._frameIdx;
+        this._heldFrameIdx = this._frameIdx; // hold current
       } else if (which === -1) {
         const frames = this._getEmotionFrames();
         this._heldFrameIdx = frames ? frames.length - 1 : this._frameIdx; // hold last
       } else {
         this._heldFrameIdx = which;
       }
-      const emotion = this._currentEmotion;
-      const validHold = this._textureSamplingEnabled && Number.isInteger(this._heldFrameIdx) && this._heldFrameIdx >= 0
-        && this._heldFrameIdx < (this._frameUrls[emotion] || []).length;
-      if (validHold && this._sampleFrameIndex(emotion, this._heldFrameIdx) !== this._heldFrameIdx) {
-        if (!this._requiredFrameIndices.has(emotion)) this._requiredFrameIndices.set(emotion, new Set());
-        this._requiredFrameIndices.get(emotion).add(this._heldFrameIdx);
-        this._frameSamplingPlans.delete(emotion);
-        this._textureDemandRevision++;
-      }
-      const heldUrl = this._frameUrls[emotion]?.[this._heldFrameIdx];
-      this._videoFrozenHold = (which === undefined || which === null) && !!this._videoDisplay
-        && this._videoDisplay.label === emotion && this._activeFramePhase === "frames"
-        && this._heldFrameIdx === this._activeFrameIdx;
-      this._frameStore.replacePins("hold", heldUrl && !this._videoFrozenHold ? [heldUrl] : []);
       this._held = true;
-      if (!this._textureSamplingEnabled) {
-        this._activeFramePhase = "frames";
-        this._activeFrameIdx = this._heldFrameIdx;
-      }
+      this._activeFramePhase = "frames";
+      this._activeFrameIdx = this._heldFrameIdx;
       this._showFrame(this._heldFrameIdx);
     }
 
@@ -688,9 +563,17 @@
 
     clearHold() {
       this._held = false;
-      this._videoFrozenHold = false;
-      this._frameStore.replacePins("hold", []);
-      this._refreshTextureDemand();
+    }
+
+    applyCharacterConfig(cfg) {
+      this.cfg = cfg || {};
+      this._characterScale = typeof this.cfg.characterScale === 'number' && this.cfg.characterScale > 0 ? this.cfg.characterScale : 1.0;
+      this._applyCurrentTransform();
+    }
+
+    setDisplayScale(scale) {
+      this._displayScale = Math.max(0.6, Math.min(1, Number(scale) || 1));
+      this._applyCurrentTransform();
     }
 
     resize(w, h) {
@@ -721,75 +604,171 @@
     }
 
     _showFrame(idx) {
-      this._refreshTextureDemand(idx);
-      if (this._videoFrozenHold) {
-        // A ready hold adopts the displayed sampled source, just as the static
-        // _showFrame path does. clearHold must resume from that same identity.
-        this._frameIdx = this._heldFrameIdx;
-        return;
-      }
       const frames = this._getEmotionFrames();
       if (!frames || frames.length === 0) return;
-      const logicalIdx = idx % frames.length;
-      const emotion = this._frames[this._currentEmotion] ? this._currentEmotion : "normal";
-      let targetIdx = this._sampleFrameIndex(emotion, logicalIdx, this._sampleTimeMs);
-      const video = this._frameVideoSource;
-      const videoTarget = !!video && this._isVideoBodyIndex(emotion, targetIdx);
-      let texture, textureVideo = null;
-      try {
-        texture = videoTarget ? (video.has(targetIdx) ? video.texture(targetIdx) : null) : frames[targetIdx];
-        if (texture && videoTarget) textureVideo = video;
-      }
-      catch (error) { this._failFrameVideoSource(error); return; }
+      const targetIdx = this._speakingFrame(idx % frames.length, frames);
+      let texture = frames[targetIdx];
       if (!texture) {
-        this._displayMisses++;
         // file:// assets are decoded asynchronously. Falling back to the first
         // loaded frame creates visible mid-animation snaps; keep the previous
         // frame until the requested texture is ready.
         const hasCurrentTexture = this.sprite.texture && this.sprite.texture.height > 1;
         if (hasCurrentTexture) return;
-        if (this._textureSamplingEnabled) {
-          try {
-            targetIdx = frames.findIndex((frame, index) => frame || (video && this._isVideoBodyIndex(emotion, index) && video.has(index)));
-            texture = frames[targetIdx];
-            if (!texture && video && targetIdx >= 0) {
-              texture = video.texture(targetIdx);
-              textureVideo = video;
-            }
-          } catch (error) { this._failFrameVideoSource(error); return; }
-        } else {
-          texture = frames.find(Boolean);
-          if (!texture && video) {
-            try {
-              targetIdx = Array.from({ length: frames.length }, (_, i) => i)
-                .find(index => this._isVideoBodyIndex(emotion, index) && video.has(index));
-              if (targetIdx !== undefined) { texture = video.texture(targetIdx); textureVideo = video; }
-            } catch (error) { this._failFrameVideoSource(error); return; }
-          }
-        }
+        texture = frames.find(Boolean);
       }
       if (!texture) return;
-      this._frameIdx = logicalIdx;
+      this._frameIdx = targetIdx;
       this._activeFramePhase = "frames";
       this._activeFrameIdx = targetIdx;
-      this._applyFrame(texture, textureVideo);
+      this._applyFrame(texture);
     }
 
-    _applyFrame(texture, video = null) {
-      if (!texture) return;
-      if (this._videoDisplay?.texture !== texture || this._videoDisplay?.source !== video) {
-        if (video) video.retainDisplay(texture);
-        this.sprite.texture = texture;
-        this._releaseVideoDisplay();
-        if (video) {
-          this._videoDisplay = { source: video, texture, label: this._currentEmotion };
-          this._frameVideoStats.videoDisplays++;
-        }
+    _loadTextureFromImage(url) {
+      const key = String(url || "");
+      if (!key) return Promise.resolve(null);
+
+      const cached = this._texturePromisesByUrl.get(key);
+      if (cached) {
+        return cached.then((texture) => {
+          if (texture && !texture.destroyed && texture.baseTexture && !texture.baseTexture.destroyed) {
+            return texture;
+          }
+          this._texturePromisesByUrl.delete(key);
+          return this._loadTextureFromImage(key);
+        });
       }
+
+      const loadPromise = this._isKtx2Url(key)
+        ? this._loadTextureFromCompressedAsset(key)
+        : this._loadTextureFromRasterImage(key);
+
+      this._texturePromisesByUrl.set(key, loadPromise);
+      return loadPromise;
+    }
+
+    _isKtx2Url(url) {
+      return /\.ktx2(?:[?#]|$)/i.test(String(url || ""));
+    }
+
+    _pngFallbackUrl(url) {
+      const key = String(url || "");
+      if (!this._isKtx2Url(key)) return "";
+      return key
+        .replace(/(frames[^/?#]*?)_ktx2_uastc_q\d+_z\d+(?=[/\\])/i, "$1")
+        .replace(/\.ktx2(?=([?#]|$))/i, ".png");
+    }
+
+    _loadTextureFromRasterImage(key) {
+      return new Promise((resolve) => {
+        const img = new Image();
+        img.decoding = "async";
+        if (/^https?:\/\//i.test(key)) {
+          img.crossOrigin = "anonymous";
+        }
+        img.onload = async () => {
+          try {
+            if (typeof img.decode === "function") {
+              try {
+                await img.decode();
+              } catch (_) {
+                // onload already fired; some Chromium/file:// paths reject decode().
+              }
+            }
+            const tex = PIXI.Texture.from(img);
+            if (tex.baseTexture && typeof tex.baseTexture.update === "function") {
+              tex.baseTexture.update();
+            }
+            await this._prepareTexture(tex);
+            resolve(tex);
+          } catch (e) {
+            console.error("[SpriteRenderer] Texture.from failed:", key.slice(0, 160), e);
+            resolve(null);
+          }
+        };
+        img.onerror = () => {
+          console.error("[SpriteRenderer] IMG FAIL:", key.slice(0, 160));
+          resolve(null);
+        };
+        img.src = key;
+      }).then((texture) => {
+        if (!texture) {
+          this._texturePromisesByUrl.delete(key);
+        }
+        return texture;
+      });
+    }
+
+    async _ensureCompressedTextureRuntime() {
+      if (this._compressedTextureRuntimeReady) return true;
+      if (this._compressedTextureRuntimePromise) {
+        return this._compressedTextureRuntimePromise;
+      }
+      this._compressedTextureRuntimePromise = (async () => {
+        if (!window.PixiBasisKtx2Shim || !PIXI.Assets) {
+          console.warn("[SpriteRenderer] KTX2 loader unavailable; falling back to PNG");
+          return false;
+        }
+        try {
+          await PixiBasisKtx2Shim.KTX2Parser.loadTranscoder(
+            "./vendor/basis_transcoder.js",
+            "./vendor/basis_transcoder.wasm"
+          );
+          await PIXI.Assets.init({
+            texturePreference: { format: ["ktx2", "ktx", "png"] },
+          });
+          this._compressedTextureRuntimeReady = true;
+          console.log("[SpriteRenderer] KTX2 compressed texture runtime ready");
+          return true;
+        } catch (e) {
+          console.warn("[SpriteRenderer] KTX2 runtime init failed; falling back to PNG", e);
+          return false;
+        }
+      })();
+      return this._compressedTextureRuntimePromise;
+    }
+
+    async _loadTextureFromCompressedAsset(key) {
+      if (!(await this._ensureCompressedTextureRuntime())) {
+        const fallback = this._pngFallbackUrl(key);
+        return fallback ? this._loadTextureFromImage(fallback) : null;
+      }
+      try {
+        const loaded = await PIXI.Assets.load({
+          src: key,
+          format: "ktx2",
+          loadParser: "loadKTX2",
+        });
+        const texture = Array.isArray(loaded) ? loaded[0] : loaded;
+        if (!texture) throw new Error("PIXI.Assets.load returned no texture");
+        const tex = texture.baseTexture ? texture : new PIXI.Texture(texture);
+        await this._prepareTexture(tex);
+        return tex;
+      } catch (e) {
+        console.warn("[SpriteRenderer] KTX2 load failed, trying PNG fallback:", key.slice(0, 160), e);
+        this._texturePromisesByUrl.delete(key);
+        const fallback = this._pngFallbackUrl(key);
+        return fallback ? this._loadTextureFromImage(fallback) : null;
+      }
+    }
+
+    _prepareTexture(texture) {
+      return new Promise((resolve) => {
+        const prepare = app.renderer && app.renderer.plugins && app.renderer.plugins.prepare;
+        if (!prepare || typeof prepare.upload !== "function") {
+          resolve();
+          return;
+        }
+        try {
+          prepare.upload(texture, resolve);
+        } catch (_) {
+          resolve();
+        }
+      });
+    }
+
+    _applyFrame(texture) {
+      if (!texture) return;
       this.sprite.texture = texture;
-      const url = this._textureUrls.get(texture);
-      if (url) this._frameStore.get(url);
-      this._frameStore.replacePins("display", url ? [url] : []);
       this._applyCurrentTransform();
       this._updateMouthLayer();
     }
@@ -800,32 +779,33 @@
         this.sprite.scale.set(1);
         return;
       }
-      // Fit the character by the canvas it was authored on, not by this frame: a frame
-      // wider than the canvas (hair blowing past its edge) must extend beyond it, centred
-      // at the bottom like every other frame, instead of shrinking the character.
-      const cfg = this._clipConfigs[this._currentEmotion] || {};
-      const fitWidth = cfg.canvasWidth > 0 ? cfg.canvasWidth : texture.width;
-      const fitHeight = cfg.canvasHeight > 0 ? cfg.canvasHeight : texture.height;
       if (this._viewportBounds) {
         const b = this._viewportBounds;
         const maxW = b.width * 0.64;
         const maxH = b.height * 0.90;
-        const scale = Math.min(maxW / fitWidth, maxH / fitHeight);
+        const scale = Math.min(maxW / texture.width, maxH / texture.height);
         this.sprite.scale.set(scale);
         this.sprite.x = b.x + b.width * 0.52;
-        // Keep the lower artwork just inside the CRT viewport.
-        this.sprite.y = b.y + b.height - Math.max(3, b.height * 0.012);
+        this.sprite.y = b.y + b.height * 0.96;
         return;
       }
       const h = app.screen.height;
-      const scale = h / fitHeight;
+      const w = app.screen.width;
+      const charScale = typeof this._characterScale === 'number' && this._characterScale > 0 ? this._characterScale : 1.0;
+      let scale = (h / texture.height) * charScale;
+      if (this.cfg?.fitWidth) {
+        const maxW = w * 0.95;
+        if (texture.width * scale > maxW) {
+          scale = maxW / texture.width;
+        }
+      }
+      scale *= this._displayScale || 1;
       this.sprite.scale.set(scale);
       this.sprite.x = app.screen.width / 2;
       this.sprite.y = h;
     }
 
     _hideMouthLayer() {
-      this._frameStore.replacePins("mouth-display", []);
       if (this._mouthOverlay) {
         this._mouthOverlay.visible = false;
         this._mouthOverlay.x = 0;
@@ -838,7 +818,8 @@
     _updateMouthLayer() {
       const cfg = this._mouthConfigs[this._currentEmotion];
       const textures = this._mouthTextures[this._currentEmotion] || [];
-      if (!cfg || !textures.length) {
+      if (!cfg || !textures.length || this._activeFramePhase !== 'frames' ||
+          this._mouthAssetOwner(cfg.frameUrls) !== this._characterOwner) {
         this._hideMouthLayer();
         return;
       }
@@ -854,7 +835,7 @@
       let bestDist = Infinity;
       const mode = cfg.mode || "full_map";
       const silenceClose = mode === "silence_close";
-      const targetValue = silenceClose ? 0.0 : this._mouthValue;
+      const targetValue = silenceClose || !this._speaking ? 0.0 : this._mouthValue;
       for (let i = 0; i < n; i++) {
         const level = typeof openness[i] === "number" ? openness[i] : (i / Math.max(1, n - 1));
         const dist = Math.abs(level - targetValue);
@@ -871,14 +852,11 @@
       }
 
       this._mouthOverlay.texture = texture;
-      const mouthUrl = this._textureUrls.get(texture);
-      this._frameStore.replacePins("mouth-display", mouthUrl ? [mouthUrl] : []);
       const sourceAnchors = Array.isArray(cfg.sourceAnchors) ? cfg.sourceAnchors : null;
       this._mouthSourceAnchor = sourceAnchors && sourceAnchors[bestIdx] ? sourceAnchors[bestIdx] : null;
 
       if (silenceClose) {
-        const threshold = Number.isFinite(cfg.silenceThreshold) ? cfg.silenceThreshold : 0.08;
-        const shouldClose = !this._speaking || this._mouthValue <= threshold;
+        const shouldClose = !this._mouthIsOpen();
         this._mouthOverlay.visible = shouldClose;
         if (shouldClose) {
           const maskAmp = Number.isFinite(cfg.silenceMaskAmplitude) ? cfg.silenceMaskAmplitude : 0.75;
@@ -893,12 +871,8 @@
         this._mouthOverlay.visible = true;
         this._drawMouthMask(Math.max(this._mouthValue, 0.05), cfg);
       } else {
-        this._mouthOverlay.visible = this._mouthValue > 0.01;
-        if (this._mouthValue > 0.01) {
-          this._drawMouthMask(Math.max(this._mouthValue, 0.05), cfg);
-        } else {
-          this._hideMouthLayer();
-        }
+        this._mouthOverlay.visible = true;
+        this._drawMouthMask(0.75, cfg);
       }
     }
 
@@ -1000,12 +974,12 @@
             Math.round(app.ticker.deltaMS));
         }
 
-        if (!this._characterActive || !this._idleAnimationEnabled) { silentGuardHit++; return; }
+        if (!this._idleAnimationEnabled) { silentGuardHit++; return; }
         if (this._held) return;
         if (this._transitionQueue.length > 0) return;
 
         const frames = this._getEmotionFrames();
-        if (!frames || frames.length === 0 || !(frames.some(Boolean) || this._hasReadyFrameVideo())) {
+        if (!frames || frames.length === 0 || !frames.some(Boolean)) {
           silentGuardHit++;
           if (silentGuardHit === 60) {
             console.log("[SpriteRenderer] no frames for emotion: %s, keys: %s",
@@ -1027,18 +1001,15 @@
 
         elapsed += Math.min(app.ticker.deltaMS, 100);
         if (elapsed < interval) return;
-        const steps = this._textureSamplingEnabled
-          ? Math.floor(elapsed / interval) : Math.min(4, Math.floor(elapsed / interval));
+        const steps = Math.min(4, Math.floor(elapsed / interval));
         elapsed -= steps * interval;
 
         let advanced = false;
-        let crossedCycle = false;
         for (let i = 0; i < steps; i++) {
           if (onceThenHold && this._frameIdx >= frames.length - 1) {
             break;
           }
 
-          const previousIdx = this._frameIdx;
           if (onceThenHold) {
             this._frameIdx = Math.min(this._frameIdx + 1, frames.length - 1);
           } else if (this._speaking && mouthCfg && frames.length > 1) {
@@ -1048,7 +1019,6 @@
           } else {
             this._frameIdx = (this._frameIdx + 1) % frames.length;
           }
-          if (!onceThenHold && this._frameIdx <= previousIdx) crossedCycle = true;
           advanced = true;
         }
 
@@ -1056,12 +1026,10 @@
           return;
         }
 
-        if (this._textureSamplingEnabled) this._sampleTimeMs = this._frameIdx * interval + elapsed;
         this._showFrame(this._frameIdx);
         if (onceThenHold && this._frameIdx >= frames.length - 1) {
           this._notifyCycleComplete(emotion);
-        } else if (!onceThenHold && (this._textureSamplingEnabled ? crossedCycle : this._frameIdx === 0)) {
-          if (this._textureSamplingEnabled) this._cycleCompletedForEmotion = "";
+        } else if (!onceThenHold && this._frameIdx === 0) {
           this._notifyCycleComplete(emotion);
         } else {
           this._cycleCompletedForEmotion = "";
@@ -1088,12 +1056,10 @@
 
     _playTransition(frames, onDone) {
       this._transitionQueue = [...frames];
-      this._frameStore.replacePins("transition-playing", frames.map(texture => this._textureUrls.get(texture)).filter(Boolean));
       let idx = 0;
       const step = () => {
         if (idx >= this._transitionQueue.length) {
           this._transitionQueue = [];
-          this._frameStore.replacePins("transition-playing", []);
           onDone && onDone();
           return;
         }
@@ -1105,6 +1071,8 @@
   }
 
   // ---------------------------------------------------------------------------
+  // Live2DRenderer — optional pixi-live2d-display wrapper
+  // ---------------------------------------------------------------------------
   class SpriteForgeRuntime {
     constructor(sprite) {
       this.sprite = sprite;
@@ -1114,7 +1082,6 @@
       this.pendingExpression = null;
       this.forcedNodeId = null;
       this.speechActive = false;
-      this.lastSpeechEndedAt = Date.now();
       this.activeSpeechIntent = null;
       this.transitionHoldActive = false;
       this.postSpeechTimer = null;
@@ -1144,7 +1111,9 @@
       this.rootNodeId = payload.rootNodeId || null;
       this.nodeDurations = payload.durations || {};
       this.cfg = payload.config || {};
-      this.lastSpeechEndedAt = this.speechActive ? null : Date.now();
+      if (this.sprite && typeof this.sprite.applyCharacterConfig === 'function') {
+        this.sprite.applyCharacterConfig(this.cfg);
+      }
       this.nodesById = {};
       this.labelToIds = {};
       for (const node of this.graph.nodes || []) {
@@ -1157,34 +1126,9 @@
       if (!this.rootNodeId && this.graph.nodes && this.graph.nodes.length) {
         this.rootNodeId = this.graph.nodes[0].id;
       }
-      if (this.rootNodeId) this._playNode(this.rootNodeId);
-      this._prefetchGraphEntries();
+      this.currentNodeId = null;
+      if (this.rootNodeId) this._playNode(this.rootNodeId, true);
       console.log("[SpriteForgeRuntime] graph loaded:", (this.graph.nodes || []).length, "nodes");
-    }
-
-    refreshResourcePolicy() {
-      if (!this.currentNodeId) return;
-      this._prefetchGraphEntries();
-      this._prefetchNodeNeighborhood(this.currentNodeId);
-    }
-
-    _prefetchGraphEntries() {
-      const video = this.sprite?._frameResourcePolicy?.mode === "video";
-      const entries = new Set([
-        ...(video ? [this._label(this.rootNodeId)] : []),
-        this.cfg.defaultSpeakingTriggerLabel, this.cfg.closedEyeSpeakingTriggerLabel,
-        ...Object.values(this.cfg.emotionEntryByIntent || {}),
-        ...(this.cfg.thinkingEntryLabels || []), ...(this.cfg.seriousEntryLabels || []),
-        ...Object.values(this.cfg.postSpeechEmotionLabelByIntent || {}),
-      ]);
-      for (const edge of this.graph.edges || []) {
-        if (edge.from === this.rootNodeId && (video ? Number(edge.prob || 0) >= 0 : Number(edge.prob || 0) === 0)) {
-          entries.add(this._label(edge.to));
-        }
-      }
-      this._prefetchLabels(entries, video ? 95 : "warm", {
-        reason: "graph-entries", ...(video ? { headMs: 50 } : {}),
-      });
     }
 
     trigger(label, options = {}) {
@@ -1203,6 +1147,9 @@
         return;
       }
       this.deferredPresentationIntent = null;
+      if (typeof this.sprite.clearSpeculativeFrameLoads === "function") {
+        this.sprite.clearSpeculativeFrameLoads();
+      }
       this._prefetchForTrigger(label, "interactive");
       this._clearPostSpeechTimer();
       this.transitionHoldActive = false;
@@ -1237,8 +1184,6 @@
       this.deferredPresentationIntent = null;
       this.pendingExpression = null;
       this.forcedNodeId = null;
-      this._prefetchLabels([], "interactive", { reason: "trigger" });
-      if (this.speechActive) this.lastSpeechEndedAt = Date.now();
       this.speechActive = false;
       this.activeSpeechIntent = null;
       this.transitionHoldActive = false;
@@ -1263,7 +1208,6 @@
       if (speaking) {
         const already = this.speechActive;
         this.speechActive = true;
-        this.lastSpeechEndedAt = null;
         this.sprite.setSpeaking(true);
         this._clearPostSpeechTimer();
         this.deferredPresentationIntent = null;
@@ -1306,7 +1250,6 @@
       }
 
       const currentLabel = this._label(this.currentNodeId);
-      if (this.speechActive) this.lastSpeechEndedAt = Date.now();
       this.speechActive = false;
       this.sprite.setSpeaking(false);
       const pendingLabel = this.pendingExpression || "";
@@ -1375,13 +1318,13 @@
       if (next) this._playNode(next);
     }
 
-    _playNode(nodeId) {
+    _playNode(nodeId, force = false) {
       if (!nodeId || !this.nodesById[nodeId]) return;
       this.currentNodeId = nodeId;
       this.transitionHoldActive = false;
       this.sprite.clearHold();
       const label = this._label(nodeId);
-      this.sprite.setEmotion(label);
+      this.sprite.setEmotion(label, force);
       this._prefetchNodeNeighborhood(nodeId);
     }
 
@@ -1420,31 +1363,24 @@
         const next = this._nextAutoNode(entry);
         if (next) labels.add(this._label(next));
       }
-      this._prefetchLabels(labels, priority, { reason: "trigger" });
+      this._prefetchLabels(labels, priority, { reason: `trigger:${targetLabel}` });
     }
 
     _prefetchNodeNeighborhood(nodeId) {
-      const video = this.sprite?._frameResourcePolicy?.mode === "video";
       const edges = (this.graph.edges || [])
-        .filter((e) => e.from === nodeId && (video ? Number(e.prob || 0) >= 0 : Number(e.prob || 0) > 0));
-      // Video reserves natural and manual first hops. Static compatibility
-      // keeps its original natural-successor set and longer head horizons.
-      // Neither policy executes a graph decision.
-      const next = this._labelsForNodeIds(edges.map(edge => edge.to));
-      // Speech can exit through a deterministic release route rather than an
-      // edge. Protect that known head too; retaining the current cycle must
-      // not evict the return pose. This lookup consumes no random decision.
-      const label = this._label(nodeId);
-      if (this._has("speakingReleaseLabels", label)) {
-        const release = this._label(this._postSpeechReleaseNode(label));
-        if (release) next.add(release);
-      }
-      // Reserve every possible first hop before spending the budget on one
-      // branch's longer tail. The current window prepares the body on entry;
-      // the sprite still preserves a video's required decoder-start head.
-      this._prefetchLabels(next, video ? 95 : "interactive", {
-        reason: "graph-next", ...(video ? { headMs: 50 } : {}),
+        .filter((e) => e.from === nodeId && Number(e.prob || 0) > 0)
+        .sort((a, b) => Number(b.prob || 0) - Number(a.prob || 0));
+      if (!edges.length) return;
+      const immediate = new Set();
+      const speculative = new Set();
+      edges.forEach((edge, index) => {
+        const label = this._label(edge.to);
+        if (!label) return;
+        if (index === 0 || Number(edge.prob || 0) >= 0.4) immediate.add(label);
+        else speculative.add(label);
       });
+      this._prefetchLabels(immediate, "warm", { reason: "graph-next" });
+      this._prefetchLabels(speculative, "ambient", { reason: "graph-speculative", speculative: true });
     }
 
     _has(name, label) {
@@ -1532,12 +1468,7 @@
     }
 
     _nextAutoNode(fromId) {
-      const standbyAllowed = !this.speechActive && this.lastSpeechEndedAt !== null
-        && Date.now() - this.lastSpeechEndedAt >= Number(this.cfg.idleStandbyDelaySec ?? 30) * 1000;
-      // Gate only automatic side entry; explicit expression paths still use
-      // the authored graph and speech can interrupt without waiting.
-      const edges = (this.graph.edges || []).filter((e) => e.from === fromId && Number(e.prob || 0) > 0
-        && (standbyAllowed || this._label(e.to) !== (this.cfg.idleStandbyEntryLabel || "trans_standby")));
+      const edges = (this.graph.edges || []).filter((e) => e.from === fromId && Number(e.prob || 0) > 0);
       if (!edges.length) return fromId;
       const total = edges.reduce((sum, e) => sum + Number(e.prob || 0), 0);
       let r = Math.random() * total;
@@ -1585,7 +1516,77 @@
     }
   }
 
-  // Character rendering adapters live at their owning SDK boundary.
+  // Live2DRenderer — deprecated VTS/Live2D foreground path kept for compatibility.
+  class Live2DRenderer {
+    constructor(stage) {
+      this.stage = stage;
+      this.container = new PIXI.Container();
+      stage.addChild(this.container);
+      this._model = null;
+      this._available = typeof PIXI.live2d !== "undefined";
+      if (!this._available) {
+        console.warn("[Live2DRenderer] pixi-live2d-display is not loaded; Live2D is unavailable");
+      }
+    }
+
+    async loadModel(url) {
+      if (!this._available) return;
+      try {
+        const { Live2DModel } = PIXI.live2d;
+        const model = await Live2DModel.from(url);
+        if (this._model) {
+          this.container.removeChild(this._model);
+          this._model.destroy();
+        }
+        this._model = model;
+        this.container.addChild(model);
+        this._fitToStage();
+        console.log("[Live2DRenderer] model loaded:", url);
+      } catch (e) {
+        console.error("[Live2DRenderer] model load failed:", e);
+      }
+    }
+
+    setExpression(name) {
+      if (!this._model) return;
+      try {
+        this._model.expression(name);
+      } catch (e) {}
+    }
+
+    setMotion(group, priority) {
+      if (!this._model) return;
+      try {
+        this._model.motion(group, undefined, priority);
+      } catch (e) {}
+    }
+
+    setMouth(value) {
+      if (!this._model) return;
+      try {
+        this._model.internalModel.coreModel.setParameterValueById(
+          "ParamMouthOpenY", value
+        );
+      } catch (e) {}
+    }
+
+    resize(w, h) {
+      if (!this._model) return;
+      this._fitToStage();
+    }
+
+    _fitToStage() {
+      if (!this._model) return;
+      const w = app.renderer.width;
+      const h = app.renderer.height;
+      this._model.x = w / 2;
+      this._model.y = h / 2;
+      const scaleX = w / this._model.width;
+      const scaleY = h / this._model.height;
+      this._model.scale.set(Math.min(scaleX, scaleY));
+      this._model.anchor.set(0.5);
+    }
+  }
 
   // ---------------------------------------------------------------------------
   // Subtitle overlay
@@ -1603,6 +1604,7 @@
         fontSize: 16,
         fill: 0xffffff,
         wordWrap: true,
+        breakWords: true,
         wordWrapWidth: 400,
         align: "center",
         dropShadow: true,
@@ -1620,7 +1622,8 @@
     }
 
     resize(w, h) {
-      this._text.style.wordWrapWidth = w - 40;
+      this._text.style.wordWrapWidth = Math.max(1, w - 40);
+      this._text.style.fontSize = Math.max(12, Math.min(16, w / 18));
       this._text.x = w / 2;
       this._text.y = h - 10;
       this._redrawBg();
@@ -1641,47 +1644,20 @@
   // ---------------------------------------------------------------------------
   class RenderApp {
     constructor() {
-      this.graphicsProfile = graphicsProfile;
       this._sprite = new SpriteRenderer(app.stage);
-      this._modelAdapter = null;
-      this._modelKind = "";
-      this._modelContainer = new PIXI.Container();
+      this._live2d = new Live2DRenderer(app.stage);
       this._subtitle = new SubtitleOverlay(app.stage);
       this._spriteforgeRuntime = new SpriteForgeRuntime(this._sprite);
       this._sprite.setCycleCompleteHandler((label) => this._spriteforgeRuntime.onCycleComplete(label));
-      this._mode = "sprite";
-      this._currentIntent = null;
-      this._speaking = false;
-      this._mouth = 0;
-      this._characterConfig = null;
-      this._frameSourceConfig = null;
-      this._frameSourceGeneration = 0;
-      this._frameSourcePending = null;
-      this._frameVideoPackage = null;
-      this._frameSourceFailed = false;
-      this._frameSourceStatus = { mode: "static", reason: "video_pack_missing", budgetMiB: 2048 };
-      this._sprite._frameVideoFailureHandler = error => {
-        const generation = this._frameSourceGeneration;
-        // A synchronous decoder failure can happen during source registration.
-        // Retire the completed registration atomically on the next microtask.
-        Promise.resolve().then(() => {
-          if (generation === this._frameSourceGeneration && this._frameSourceConfig?.candidate) {
-            this._fallbackFrameVideo(error);
-          }
-        });
-      };
-      window.addEventListener("unload", () => {
-        this._frameSourceGeneration++;
-        this._frameSourceController?.abort();
-      }, { once: true });
+      this._mode = "sprite";  // 'sprite' | 'live2d' | 'both'
 
       // Initialize layers: sprite below, Live2D above, subtitles on top.
       app.stage.removeChildren();
       app.stage.addChild(this._sprite.container);
-      app.stage.addChild(this._modelContainer);
+      app.stage.addChild(this._live2d.container);
       app.stage.addChild(this._subtitle.container);
 
-      this._modelContainer.visible = false;
+      this._live2d.container.visible = false;
 
       // PixiJS' own resize event, fired after resizeTo applies, is more
       // reliable than window.resize. The callback w/h are physical pixels, so
@@ -1690,7 +1666,7 @@
         const w = app.screen.width;
         const h = app.screen.height;
         this._sprite.resize(w, h);
-        this._modelAdapter?.setViewport(this._characterViewport || null);
+        this._live2d.resize(w, h);
         this._subtitle.resize(w, h);
         this._sprite._showFrame(this._sprite._frameIdx);
       });
@@ -1702,154 +1678,27 @@
 
     // ---- Public API ----
 
-    setEmotion(emotion) {
-      if (this._mode === "sprite") this._sprite.setEmotion(emotion);
-      else this._modelAdapter?.applyIntent(emotion);
+    setEmotion(emotion, force = false) {
+      if (this._mode !== "live2d") this._sprite.setEmotion(emotion, force);
+      if (this._mode !== "sprite") this._live2d.setExpression(emotion);
     }
 
     setSpeaking(speaking) {
-      this._speaking = speaking === true;
-      if (!this._speaking) this._mouth = 0;
-      if (this._mode === "sprite") {
-        if (this._spriteforgeRuntime.currentNodeId) this._spriteforgeRuntime.setSpeaking(speaking);
-        else this._sprite.setSpeaking(speaking);
-      } else this._modelAdapter?.setSpeaking(this._speaking);
+      if (!speaking) this.setSubtitle("");
+      if (this._spriteforgeRuntime.currentNodeId) {
+        this._spriteforgeRuntime.setSpeaking(speaking);
+      } else if (this._mode !== "live2d") {
+        this._sprite.setSpeaking(speaking);
+      }
     }
 
     setMouth(value) {
-      if (this._mode === "sprite") this._sprite.setMouth(value);
-      else {
-        this._mouth = this._speaking ? Math.max(0, Math.min(1, Number(value) || 0)) : 0;
-        this._modelAdapter?.setMouth(this._mouth);
-      }
+      if (this._mode !== "live2d") this._sprite.setMouth(value);
+      if (this._mode !== "sprite") this._live2d.setMouth(value);
     }
 
-    configureCharacter(config) {
-      if (this._characterConfig?.runtime_id === config.runtime_id &&
-          Number(config.revision) < Number(this._characterConfig.revision)) return Promise.resolve();
-      if (this._characterConfig && this._characterConfig.runtime_id !== config.runtime_id) {
-        this._currentIntent = null;
-        this._speaking = false;
-        this._mouth = 0;
-      }
-      if (this._characterConfig && JSON.stringify(this._characterConfig) === JSON.stringify(config)) return this._modelAdapter?.pending;
-      const selected = config.backend || "sprite";
-      const changed = this._mode !== selected;
-      this._characterConfig = config;
-      this._mode = selected;
-      this._mouth = 0;
-      if (changed) {
-        this._spriteforgeRuntime.release();
-        this._sprite.setSpeaking(false);
-        this._sprite.setMouth(0);
-      }
-      this._sprite.setActive(selected === "sprite");
-      this._configureFrameSource(selected === "sprite" ? config.frame_source : null);
-      this._sprite.container.visible = selected === "sprite";
-      this._modelContainer.visible = selected !== "sprite";
-      if (selected !== "sprite") {
-        if (!this._modelAdapter || this._modelKind !== selected) {
-          this._modelAdapter?.destroy();
-          this._modelAdapter = window.createModelCharacter(
-            selected, app, status => this._reportCharacterStatus(status));
-          this._modelKind = selected;
-          this._modelContainer.addChild(this._modelAdapter.container);
-          this._modelAdapter.setViewport(this._characterViewport || null);
-          this._modelAdapter.setPaused(document.hidden);
-        }
-        this._modelAdapter.applyIntent(this._currentIntent?.semantic_label || this._currentIntent?.label || "normal");
-        const adapter = this._modelAdapter;
-        return adapter.configure(config).then(() => {
-          if (adapter === this._modelAdapter && this._mode !== "sprite" &&
-              this._characterConfig.runtime_id === config.runtime_id &&
-              this._characterConfig.revision === config.revision && adapter.state === "ready") {
-            adapter.setSpeaking(this._speaking);
-            adapter.setMouth(this._mouth);
-          }
-        });
-      }
-      this._modelAdapter?.unload();
-      this._sprite.setSpeaking(this._speaking);
-      this._reportCharacterStatus(this.getCharacterStatus());
-      return Promise.resolve();
-    }
-
-    getCharacterStatus() {
-      if (this._mode !== "sprite") return this._modelAdapter?.status();
-      const config = this._characterConfig || {};
-      return {
-        surface: config.surface || "render", profile_id: config.profile_id || "",
-        revision: config.revision || 0, runtime_id: config.runtime_id || "", state: "ready",
-        diagnostic: { frame_source: { ...this._frameSourceStatus } },
-      };
-    }
-
-    _applyFrameSourcePolicy(mode, reason, error = null) {
-      const budgetMiB = this._frameSourceConfig?.budgetMiB || (mode === "video" ? 384 : 2048);
-      this._sprite._frameResourcePolicy = { mode, budgetMiB };
-      this._sprite._frameStore.setBudgetBytes(budgetMiB * 1048576);
-      const gc = app.renderer.textureGC;
-      gc.maxIdle = mode === "video" ? 60 : 3600;
-      gc.checkCountMax = mode === "video" ? 30 : 600;
-      this._spriteforgeRuntime.refreshResourcePolicy();
-      this._frameSourceStatus = { requested: this._frameSourceConfig?.requested || "auto", mode,
-        budgetMiB, reason, gcMaxIdle: gc.maxIdle, gcCheckCountMax: gc.checkCountMax,
-        ...(error ? { error: String(error.message || error) } : {}) };
-      if (this._mode === "sprite") this._reportCharacterStatus(this.getCharacterStatus());
-    }
-
-    _configureFrameSource(config) {
-      const next = config || null;
-      if (JSON.stringify(next) === JSON.stringify(this._frameSourceConfig)) return;
-      this._frameSourceController?.abort();
-      this._frameSourceGeneration++;
-      this._frameVideoPackage?.disable();
-      this._frameVideoPackage = null;
-      this._frameSourcePending = null;
-      this._frameSourceFailed = false;
-      this._frameSourceConfig = next;
-      this._applyFrameSourcePolicy("static", next?.candidate ? "checking_video" : next?.reason || "video_pack_missing");
-      this._startFrameVideo();
-    }
-
-    _fallbackFrameVideo(error) {
-      this._frameSourceFailed = true;
-      this._frameVideoPackage?.disable();
-      this._frameVideoPackage = null;
-      this._applyFrameSourcePolicy("static", "video_unavailable", error);
-    }
-
-    _startFrameVideo() {
-      const config = this._frameSourceConfig;
-      if (this._mode !== "sprite" || !config?.candidate || this._frameSourceFailed
-          || !this._spriteforgeRuntime.currentNodeId || this._frameSourcePending || this._frameVideoPackage) return;
-      const generation = this._frameSourceGeneration;
-      const controller = this._frameSourceController = new AbortController();
-      this._frameSourcePending = this._loadFrameVideoSources(config, controller.signal).then(installed => {
-        if (generation !== this._frameSourceGeneration) { installed.disable(); return; }
-        this._frameVideoPackage = installed;
-        if (this._frameSourceFailed) { this._fallbackFrameVideo(new Error("Decoder startup failed")); return; }
-        this._applyFrameSourcePolicy("video", "video_ready");
-      }).catch(error => {
-        if (generation === this._frameSourceGeneration && !controller.signal.aborted) this._fallbackFrameVideo(error);
-      }).finally(() => {
-        if (generation === this._frameSourceGeneration) this._frameSourcePending = null;
-      });
-    }
-
-    async _loadFrameVideoSources(config, signal) {
-      const url = new URL("./frame_video/hybrid_source.mjs", window.location.href);
-      const module = await import(url.href);
-      signal.throwIfAborted();
-      return module.installHybridSources(this._sprite, app.renderer, PIXI,
-        config.candidate.baseUrl, config.candidate.pack, { bundle: true, verifySupport: true, signal });
-    }
-
-    _reportCharacterStatus(status) {
-      if (window.parent !== window) {
-        window.parent.postMessage({ type: "amadeus.character.status", status }, "*");
-      }
-      window.dispatchEvent(new CustomEvent("amadeus-character-status", { detail: status }));
+    setDisplayScale(scale) {
+      this._sprite.setDisplayScale(scale);
     }
 
     setSubtitle(text) {
@@ -1862,6 +1711,10 @@
 
     loadTransitionFrames(fromEmotion, toEmotion, urls) {
       this._sprite.loadTransitionFrames(fromEmotion, toEmotion, urls);
+    }
+
+    async loadLive2DModel(url) {
+      await this._live2d.loadModel(url);
     }
 
     setIdleAnimation(enabled) {
@@ -1882,22 +1735,14 @@
 
     loadSpriteForgeGraph(payload) {
       this._spriteforgeRuntime.loadGraph(payload || {});
-      this._startFrameVideo();
     }
 
-    triggerCharacterIntent(label, options = {}) {
-      // A queued event resolved before a selection change belongs to that old
-      // backend. Current semantic truth is replayed after the new config.
-      if (options.backend && options.backend !== this._mode) return;
-      this._currentIntent = { ...options, label };
-      if (this._mode === "sprite") this._spriteforgeRuntime.trigger(label, options);
-      else this._modelAdapter?.applyIntent(options.semantic_label || label);
+    triggerSpriteForgeIntent(label, options = {}) {
+      this._spriteforgeRuntime.trigger(label, options);
     }
 
-    releaseCharacter(options = {}) {
-      this._currentIntent = null;
-      if (this._mode === "sprite") this._spriteforgeRuntime.release(options);
-      else this._modelAdapter?.release();
+    releaseSpriteForge(options = {}) {
+      this._spriteforgeRuntime.release(options);
     }
 
     holdSpriteFrame(which) {
@@ -1912,23 +1757,12 @@
       this._sprite.clearHold();
     }
 
-    setCharacterViewportBounds(bounds) {
-      this._characterViewport = bounds || null;
+    setSpriteViewportBounds(bounds) {
       this._sprite.setViewportBounds(bounds);
-      this._modelAdapter?.setViewport(bounds);
     }
 
-    setCharacterViewportMask(mask) {
+    setSpriteViewportMask(mask) {
       this._sprite.container.mask = mask || null;
-      this._modelContainer.mask = mask || null;
-    }
-
-    getModelCharacterContainer() { return this._modelContainer; }
-
-    getCharacterLayers() { return [this._sprite.container, this._modelContainer]; }
-
-    getTextureStats() {
-      return { ...this._sprite._frameStore.stats(), displayMiss: this._sprite._displayMisses };
     }
 
     getPixiApp() {
@@ -1937,13 +1771,17 @@
 
     setMode(mode) {
       const value = String(mode || "sprite").toLowerCase();
-      if (["work", "working", "work_surface", "provider_work"].includes(value)) return;
-      // The selected Host profile owns the backend. Legacy graph bootstrap
-      // mode calls cannot override a selection or start loading a model.
-      if (this._characterConfig || value !== "sprite") return;
-      this._mode = "sprite";
-      this._sprite.container.visible = true;
-      this._modelContainer.visible = false;
+      if (value === "work" || value === "working" || value === "work_surface" || value === "provider_work") {
+        return;
+      }
+      const normalized = value === "hybrid" ? "both" : value;
+      if (["sprite", "live2d", "both"].indexOf(normalized) < 0) {
+        console.warn("[RenderApp] ignoring unknown legacy render mode:", mode);
+        return;
+      }
+      this._mode = normalized;
+      this._sprite.container.visible = (normalized !== "live2d");
+      this._live2d.container.visible = (normalized !== "sprite");
     }
 
     // ---- Internals ----
@@ -1952,17 +1790,15 @@
       const w = app.screen.width;
       const h = app.screen.height;
       this._sprite.resize(w, h);
-      this._modelAdapter?.setViewport(this._characterViewport || null);
+      this._live2d.resize(w, h);
       this._subtitle.resize(w, h);
       this._sprite._showFrame(this._sprite._frameIdx);
     }
   }
 
-  // Mount the surface adapter for the existing Host bridge.
+  // Mount globally for Python runJavaScript() calls.
   window.renderApp = new RenderApp();
   console.log("[RenderEngine] renderer.js initialized");
-  document.addEventListener("visibilitychange", () => window.renderApp._modelAdapter?.setPaused(document.hidden));
-  window.addEventListener("unload", () => window.renderApp._modelAdapter?.destroy(), { once: true });
 
   // ---------------------------------------------------------------------------
   // Render bridge. Embedded GUI renderers reuse the authenticated parent
@@ -1983,7 +1819,7 @@
       }
       switch (method) {
         case "render.emotion":
-          app.setEmotion(p.emotion);
+          app.setEmotion(p.emotion, !!p.force);
           break;
         case "render.speaking":
           app.setSpeaking(p.speaking);
@@ -1996,9 +1832,6 @@
           break;
         case "render.sprite_frames":
           app.loadSpriteFrames(p.emotion, p.urls || []);
-          break;
-        case "render.character_config":
-          app.configureCharacter(p);
           break;
         case "render.mode":
           app.setMode(p.mode);
@@ -2018,11 +1851,11 @@
         case "render.spriteforge_graph":
           app.loadSpriteForgeGraph(p);
           break;
-        case "render.character_intent":
-          app.triggerCharacterIntent(p.label, p);
+        case "render.spriteforge_intent":
+          app.triggerSpriteForgeIntent(p.label, p);
           break;
-        case "render.character_release":
-          app.releaseCharacter(p);
+        case "render.spriteforge_release":
+          app.releaseSpriteForge(p);
           break;
         case "render.hold_frame":
           app.holdSpriteFrame(p.which);
